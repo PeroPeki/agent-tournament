@@ -1,0 +1,6 @@
+human_player,other_team,blue,flag_capture
+human_player,other_team,tied,timeout
+my_team,other_team,tied,timeout
+my_team,other_team,tied,timeout
+my_team,other_team,red,flag_capture
+my_team,other_team,blue,flag_capture
