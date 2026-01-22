@@ -46,21 +46,27 @@ class Agent:
             self.attack_vector = (-1, 0)
 
     def update_map(self, visible_world, position, shared_knowledge):
+        # osiguraj da tick postoji (ne povećava se ovdje)
+        shared_knowledge['tick'] = shared_knowledge.get('tick', 0)
+
+        # init shared structures
         if 'game_map' not in shared_knowledge:
             shared_knowledge['game_map'] = {}
         if 'visited' not in shared_knowledge:
             shared_knowledge['visited'] = set()
-        
-        # --- HEARTBEAT SYSTEM (Tko je ziv?) ---
         if 'heartbeats' not in shared_knowledge:
             shared_knowledge['heartbeats'] = {}
-        # Zapisi trenutno vrijeme kao dokaz da sam ziv
-        shared_knowledge['heartbeats'][self.index] = time.time()
+        if 'our_flag_stolen' not in shared_knowledge:
+            shared_knowledge['our_flag_stolen'] = False
+
+        # heartbeat (tko je živ)
+        shared_knowledge['heartbeats'][self.index] = shared_knowledge['tick']
 
         center_index = 4
         my_x, my_y = position
         shared_knowledge['visited'].add(position)
-        
+
+        # spawn (pamti prvi put)
         if self.my_spawn is None:
             self.my_spawn = position
             shared_knowledge[f'{self.color}_spawn'] = position
@@ -70,39 +76,43 @@ class Agent:
                 char = visible_world[local_y][local_x]
                 abs_x = my_x + (local_x - center_index)
                 abs_y = my_y + (local_y - center_index)
-                
+
+                # mapiranje terena
                 if char in ['#', ' ', self.enemy_flag_tile, self.my_flag_tile]:
                     shared_knowledge['game_map'][(abs_x, abs_y)] = char
-                
+
+                # pozicije zastava
                 if char == self.enemy_flag_tile:
                     shared_knowledge['enemy_flag_pos'] = (abs_x, abs_y)
-                
+
                 if char == self.my_flag_tile:
                     shared_knowledge['my_flag_pos'] = (abs_x, abs_y)
-                
-                # --- DETEKCIJA KRADLJIVCA ZASTAVE ---
-                # Ako vidimo neprijatelja koji nosi NASU zastavu
-                if char == self.enemy_with_my_flag:
-                    shared_knowledge['enemy_carrier_pos'] = (abs_x, abs_y)
-                    shared_knowledge['our_flag_stolen'] = True
-                
-                # Ako vidimo nasu zastavu na podu/bazi, znaci da nije ukradena (reset)
-                if char == self.my_flag_tile:
+                    # naša zastava viđena => nije ukradena
                     shared_knowledge['our_flag_stolen'] = False
                     if 'enemy_carrier_pos' in shared_knowledge:
                         del shared_knowledge['enemy_carrier_pos']
+                    if 'enemy_carrier_last_seen' in shared_knowledge:
+                        del shared_knowledge['enemy_carrier_last_seen']
+
+                # neprijatelj nosi našu zastavu
+                if char == self.enemy_with_my_flag:
+                    shared_knowledge['enemy_carrier_pos'] = (abs_x, abs_y)
+                    shared_knowledge['enemy_carrier_last_seen'] = shared_knowledge['tick']
+                    shared_knowledge['our_flag_stolen'] = True
 
     def get_active_teammates_count(self, shared_knowledge):
-        """Vraca broj zivih suigraca (ukljucujuci mene)."""
-        if 'heartbeats' not in shared_knowledge:
+
+        if 'heartbeats' not in shared_knowledge or 'tick' not in shared_knowledge:
             return 1
-        
+
         count = 0
-        now = time.time()
-        # Smatramo agenta zivim ako se javio unutar zadnjih 0.5 sekundi
-        for idx, last_seen in shared_knowledge['heartbeats'].items():
-            if now - last_seen < 0.5:
+        now = shared_knowledge['tick']
+
+        for last_seen in shared_knowledge['heartbeats'].values():
+
+            if now - last_seen <= 2:
                 count += 1
+
         return count
 
     def get_full_path(self, start_pos, target_pos, shared_knowledge, holding_flag=False):
@@ -173,12 +183,21 @@ class Agent:
             for next_pos, direction in neighbors:
                 tile = game_map.get(next_pos)
                 
-                is_walkable = (tile == ' ' or tile == self.enemy_flag_tile)
-                if tile == self.my_flag_tile: is_walkable = False
-                if tile is None and final_target: is_walkable = False
+                extra_cost = 0
+                if tile == '#' or tile == self.my_flag_tile:
+                    is_walkable = False
+                elif tile == ' ' or tile == self.enemy_flag_tile:
+                    is_walkable = True
+                elif tile is None:
+                    is_walkable = True
+                    extra_cost = 3
+                else:
+                    is_walkable = False
+
+
 
                 if is_walkable:
-                    new_cost = current_cost + 1
+                    new_cost = current_cost + 1 + extra_cost
                     if not holding_flag and next_pos in visited_globally:
                         new_cost += 5 
                     
@@ -221,16 +240,108 @@ class Agent:
                     return dirname
         return None
 
+    def sidestep_dirs(self, shoot_dir):
+        if shoot_dir in ("up", "down"):
+            return ["left", "right"]
+        if shoot_dir in ("left", "right"):
+            return ["up", "down"]
+        return ["up", "down", "left", "right"]
+
+
+
     def update(self, visible_world, position, can_shoot, holding_flag, shared_knowledge, hp, ammo):
+        # --- GLOBAL TICK ---
+        if self.index == 0:
+            shared_knowledge['tick'] = shared_knowledge.get('tick', 0) + 1
+
+
         self.update_map(visible_world, position, shared_knowledge)
         
-        # --- 0. STOP & SHOOT ---
+    
+
+        # --- ROLE ASSIGNMENT (once per game) ---
+        if 'roles' not in shared_knowledge:
+            shared_knowledge['roles'] = {}
+
+            shared_knowledge['roles'][0] = "attacker"
+            shared_knowledge['roles'][1] = "goalie"
+            shared_knowledge['roles'][2] = "hunter" 
+
+        my_role = shared_knowledge['roles'].get(self.index, "attacker")
+
+
+        # --- 0. SMART SHOOT / RETREAT ---
         shoot_dir = self.check_for_enemy(visible_world)
+
+        # Ako vidim neprijatelja, ali NE mogu pucati -> ne stoj! napravi sidestep
+        if shoot_dir and (not can_shoot or ammo == 0):
+            for d in self.sidestep_dirs(shoot_dir):
+                return "move", d
+
+        # Do we see enemy carrier?
+        sees_carrier = False
+
         if shoot_dir:
-            if can_shoot:
-                return "shoot", shoot_dir
-            else:
-                return None, None
+            cx, cy = 4, 4
+
+            dx = 0
+            dy = 0
+
+            if shoot_dir == "up":
+                dy = -1
+            elif shoot_dir == "down":
+                dy = 1
+            elif shoot_dir == "left":
+                dx = -1
+            elif shoot_dir == "right":
+                dx = 1
+
+            for i in range(1, 5):
+
+                nx = cx + dx * i
+                ny = cy + dy * i
+
+                if not (0 <= nx < 9 and 0 <= ny < 9):
+                    break
+
+                tile = visible_world[ny][nx]
+
+                if tile == self.enemy_with_my_flag:
+                    sees_carrier = True
+                    break
+
+                if tile == '#' or tile in self.my_agents:
+                    break
+
+
+        # Retreat if weak
+        if shoot_dir and hp <= 1:
+
+            base = shared_knowledge.get('my_flag_pos', self.my_spawn)
+
+            if base:
+
+                bx, by = base
+                px, py = position
+
+                if abs(bx - px) > abs(by - py):
+                    direction = "right" if bx > px else "left"
+                else:
+                    direction = "down" if by > py else "up"
+
+                return "move", direction
+
+        # --- DECISION ---
+
+        # Always shoot carrier if possible
+        if shoot_dir and can_shoot and ammo > 0 and sees_carrier:
+            return "shoot", shoot_dir
+
+        # Normal shoot only if healthy
+        if shoot_dir and can_shoot and ammo > 0 and hp >= AGENT_MAX_HP / 2:
+            return "shoot", shoot_dir
+
+
         
         # --- PREPARATION ---
         if self.last_pos != position:
@@ -248,62 +359,140 @@ class Agent:
         
         # --- 1. STRATEGY SELECTION ---
         target = None
+
         our_flag_stolen = shared_knowledge.get('our_flag_stolen', False)
         enemy_carrier_pos = shared_knowledge.get('enemy_carrier_pos', None)
         active_teammates = self.get_active_teammates_count(shared_knowledge)
-        
-        # A. AKO IMAM ZASTAVU
-        if holding_flag:
-            
-            # SCENARIJ 1: Nasa zastava je UKRADENA (Stalemate)
-            if our_flag_stolen:
-                
-                # a) SOLO MODE: Ako sam zadnji prezivjeli, ja moram biti heroj
-                if active_teammates == 1:
-                    # Napadam nosaca!
-                    if enemy_carrier_pos:
-                        target = enemy_carrier_pos
-                    elif 'enemy_spawn' in shared_knowledge: # Pretpostavljamo da ide doma
-                         target = shared_knowledge['enemy_spawn']
-                    # Inace random exploration kroz default logiku
-                
-                # b) TEAM MODE: Ima jos zivih
-                else:
-                    # Idem na spawn i CEKAM (Camp)
-                    target = self.my_spawn
-                    if target:
-                        # Ako sam stigao na spawn (ili blizu), stani i cekaj
-                        tx, ty = target
-                        if abs(position[0]-tx) + abs(position[1]-ty) <= 2:
-                            return None, None # CAMPING
-            
-            # SCENARIJ 2: Nasa zastava je SIGURNA
-            else:
-                # Normalno nosi zastavu kuci za pobjedu
-                if 'my_flag_pos' in shared_knowledge:
-                    target = shared_knowledge['my_flag_pos']
-                else:
-                    target = self.my_spawn
-                    
-                # Force Touchdown Check
-                if target:
-                    tx, ty = target
-                    if abs(position[0]-tx) + abs(position[1]-ty) <= 1:
-                        if tx > position[0]: direction = "right"
-                        elif tx < position[0]: direction = "left"
-                        elif ty > position[1]: direction = "down"
-                        else: direction = "up"
-                        return "move", direction
 
-        # B. AKO NEMAM ZASTAVU (Hunter / Attacker)
-        else:
-            # SCENARIJ: Nasa zastava je UKRADENA -> Prioritet je ubiti kradljivca!
-            if our_flag_stolen and enemy_carrier_pos:
-                target = enemy_carrier_pos
+        tick = shared_knowledge.get('tick', 0)
+        enemy_carrier_last_seen = shared_knowledge.get('enemy_carrier_last_seen', -9999)
+        base = shared_knowledge.get('my_flag_pos', self.my_spawn)
+
+        # ---------------- GOALIE ----------------
+        if my_role == "goalie":
+            tick = shared_knowledge.get('tick', 0)
+            enemy_carrier_last_seen = shared_knowledge.get('enemy_carrier_last_seen', -9999)
+            base = shared_knowledge.get('my_flag_pos', self.my_spawn)
+
+            # default: čuvaj bazu
+            if base:
+                bx, by = base
+                if abs(position[0] - bx) + abs(position[1] - by) <= 2:
+                    return None, None
+                target = base
+            else:
+                target = self.my_spawn
+            # intercept samo ako imamo carrier_pos + recent info
+            if our_flag_stolen and enemy_carrier_pos and (tick - enemy_carrier_last_seen) <= 6:
+                ex, ey = enemy_carrier_pos  # <- OVO je ključ
+
+                if base:
+                    bx, by = base
+
+                    ix = ex + (1 if bx > ex else -1 if bx < ex else 0)
+                    iy = ey + (1 if by > ey else -1 if by < ey else 0)
+                    intercept = (ix, iy)
+
+                    # ne idi predaleko od baze
+                    if abs(ix - bx) + abs(iy - by) <= 6:
+                        target = intercept
+
+
+        # ---------------- ATTACKER ----------------
+        elif my_role == "attacker":
+            if holding_flag:
+                if our_flag_stolen and active_teammates > 1:
+                    target = self.my_spawn   # camp
+                else:
+                    target = shared_knowledge.get('my_flag_pos', self.my_spawn)
+            else:
+                if our_flag_stolen and enemy_carrier_pos:
+                    target = enemy_carrier_pos
+                else:
+                    target = shared_knowledge.get('enemy_flag_pos')
+         
+        # ---------------- HUNTER ----------------
+        elif my_role == "hunter":
+
+            if our_flag_stolen:
+
+                if enemy_carrier_pos:
+                    target = enemy_carrier_pos
+
+                else:
+                    # idi na zadnje mjesto gdje je viđen
+                    last = shared_knowledge.get('enemy_carrier_last_seen', -9999)
+
+                    if tick - last <= 10:
+                        target = shared_knowledge.get('enemy_carrier_pos')
+
+            else:
+                target = shared_knowledge.get('enemy_flag_pos')
             
-            # SCENARIJ: Klasicni napad na tudu zastavu
-            elif 'enemy_flag_pos' in shared_knowledge:
-                target = shared_knowledge['enemy_flag_pos']
+
+
+        # --- FALLBACK TO ORIGINAL STRATEGY ---
+        if target is None:
+
+            # A. AKO IMAM ZASTAVU
+            if holding_flag:
+
+                # SCENARIJ 1: Nasa zastava je UKRADENA (Stalemate)
+                if our_flag_stolen:
+
+                    # a) SOLO MODE: Ako sam zadnji prezivjeli, ja moram biti heroj
+                    if active_teammates == 1:
+                        # Napadam nosaca!
+                        if enemy_carrier_pos:
+                            target = enemy_carrier_pos
+                        elif 'enemy_spawn' in shared_knowledge:
+                            target = shared_knowledge['enemy_spawn']
+
+                    # b) TEAM MODE: Ima jos zivih
+                    else:
+
+                        target = self.my_spawn
+
+                        if target:
+                            tx, ty = target
+
+                            if abs(position[0] - tx) + abs(position[1] - ty) <= 2:
+                                return None, None
+
+                # SCENARIJ 2: Nasa zastava je SIGURNA
+                else:
+
+                    if 'my_flag_pos' in shared_knowledge:
+                        target = shared_knowledge['my_flag_pos']
+                    else:
+                        target = self.my_spawn
+
+                    if target:
+
+                        tx, ty = target
+
+                        if abs(position[0] - tx) + abs(position[1] - ty) <= 1:
+
+                            if tx > position[0]:
+                                direction = "right"
+                            elif tx < position[0]:
+                                direction = "left"
+                            elif ty > position[1]:
+                                direction = "down"
+                            else:
+                                direction = "up"
+
+                            return "move", direction
+
+            # B. AKO NEMAM ZASTAVU
+            else:
+
+                if our_flag_stolen and enemy_carrier_pos:
+                    target = enemy_carrier_pos
+
+                elif 'enemy_flag_pos' in shared_knowledge:
+                    target = shared_knowledge['enemy_flag_pos']
+
 
 
         # --- 2. PATH EXECUTION & PLANNING ---
