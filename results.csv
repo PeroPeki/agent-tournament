@@ -178,3 +178,10 @@ my_team,other_team,blue,elimination
 my_team,other_team,red,flag_capture
 my_team,other_team,blue,elimination
 my_team,other_team,blue,elimination
+my_team,other_team,red,flag_capture
+my_team,other_team,tied,mutual_elimination
+my_team,other_team,blue,flag_capture
+my_team,other_team,blue,flag_capture
+my_team,other_team,blue,flag_capture
+my_team,other_team,blue,flag_capture
+other_team,my_team,red,flag_capture
